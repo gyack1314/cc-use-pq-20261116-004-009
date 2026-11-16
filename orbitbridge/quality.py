@@ -51,6 +51,38 @@ def check_all(connection: sqlite3.Connection) -> dict[str, Any]:
             issue("created_before_batch", "handoff", identifier, "交接时间早于批次接收时间")
         if row["status"] == "acknowledged" and row["acknowledged_at"] < row["created_at"]:
             issue("ack_before_create", "handoff", identifier, "确认时间早于交接创建时间")
+    for row in connection.execute("SELECT * FROM deliveries"):
+        identifier = str(row["delivery_id"])
+        if row["rows"] > 0 and (row["first_handoff_id"] is None or row["last_handoff_id"] is None):
+            issue("delivery_bounds", "delivery", identifier, "非空交付缺少交接编号范围")
+        items = connection.execute("SELECT COUNT(*) FROM delivery_items WHERE delivery_id=?",
+                                   (row["delivery_id"],)).fetchone()[0]
+        if items != row["rows"]:
+            issue("delivery_coverage", "delivery", identifier, "交付条目数与清单行数不符")
+        if row["status"] == "registered" and row["registered_at"] is None:
+            issue("delivery_registered_at", "delivery", identifier, "已登记交付缺少登记时间")
+    for row in connection.execute("SELECT * FROM receipts WHERE status='verified'"):
+        identifier = str(row["receipt_pk"])
+        if row["delivery_id"] is None:
+            issue("receipt_delivery", "receipt", identifier, "已核回执缺少交付版本")
+        if row["verified_at"] is None:
+            issue("receipt_verified_at", "receipt", identifier, "已核回执缺少核对时间")
+    for row in connection.execute("SELECT * FROM responsibility_events r WHERE revision>1 AND NOT EXISTS "
+                                  "(SELECT 1 FROM responsibility_events p WHERE p.handoff_id=r.handoff_id "
+                                  "AND p.revision=r.revision-1)"):
+        issue("responsibility_gap", "handoff", str(row["handoff_id"]), "责任修订不连续")
+    for row in connection.execute("SELECT h.handoff_id FROM handoffs h WHERE NOT EXISTS "
+                                  "(SELECT 1 FROM responsibility_events r WHERE r.handoff_id=h.handoff_id)"):
+        issue("responsibility_missing", "handoff", str(row["handoff_id"]), "交接项缺少责任安排")
+    for row in connection.execute("SELECT i.receipt_pk,i.handoff_id,i.verdict FROM receipt_items i "
+                                  "JOIN receipts r USING(receipt_pk) "
+                                  "WHERE r.status='verified' AND i.verdict='released'"):
+        latest = connection.execute(
+            "SELECT state FROM responsibility_events WHERE handoff_id=? ORDER BY revision DESC LIMIT 1",
+            (row["handoff_id"],)).fetchone()
+        if latest is None or latest["state"] != "released_external":
+            issue("released_without_responsibility", "handoff", str(row["handoff_id"]),
+                  f"回执 {row['receipt_pk']} 判定解除但责任未解除")
     return {"ok": not issues, "issues": issues, "counts": store.counts(connection)}
 
 

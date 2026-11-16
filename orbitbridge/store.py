@@ -58,6 +58,79 @@ CREATE TABLE IF NOT EXISTS activity (
   entity_id TEXT NOT NULL, occurred_at TEXT NOT NULL, details_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS activity_entity ON activity(entity_type, entity_id, activity_id);
+CREATE TABLE IF NOT EXISTS receivers (
+  receiver_id TEXT PRIMARY KEY, label TEXT NOT NULL,
+  active INTEGER NOT NULL CHECK(active IN (0,1)), created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deliveries (
+  delivery_id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_key TEXT NOT NULL UNIQUE,
+  subscription_id TEXT NOT NULL REFERENCES subscriptions(subscription_id),
+  file_name TEXT NOT NULL, file_path TEXT NOT NULL UNIQUE, file_sha256 TEXT NOT NULL,
+  descriptor_name TEXT NOT NULL, descriptor_path TEXT NOT NULL UNIQUE, descriptor_sha256 TEXT NOT NULL,
+  body_sha256 TEXT NOT NULL, header_json TEXT NOT NULL, body_text TEXT NOT NULL,
+  rows INTEGER NOT NULL CHECK(rows >= 0), first_handoff_id INTEGER, last_handoff_id INTEGER,
+  receiver_id TEXT REFERENCES receivers(receiver_id), responsibility_revision INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK(status IN ('prepared','registered')),
+  created_at TEXT NOT NULL, registered_at TEXT,
+  CHECK((status='prepared' AND registered_at IS NULL) OR
+        (status='registered' AND registered_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS deliveries_subscription ON deliveries(subscription_id, delivery_key);
+CREATE TABLE IF NOT EXISTS delivery_items (
+  delivery_id INTEGER NOT NULL REFERENCES deliveries(delivery_id), handoff_id INTEGER NOT NULL REFERENCES handoffs(handoff_id),
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 1), responsibility_revision INTEGER NOT NULL,
+  observation_fingerprint TEXT NOT NULL,
+  status_at_delivery TEXT NOT NULL CHECK(status_at_delivery IN ('pending','acknowledged')),
+  PRIMARY KEY(delivery_id, handoff_id), UNIQUE(delivery_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS delivery_items_handoff ON delivery_items(handoff_id);
+CREATE TABLE IF NOT EXISTS responsibility_events (
+  responsibility_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  handoff_id INTEGER NOT NULL REFERENCES handoffs(handoff_id),
+  subscription_id TEXT NOT NULL REFERENCES subscriptions(subscription_id),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  event_type TEXT NOT NULL CHECK(event_type IN ('created','acknowledged','reassigned','externally_released')),
+  state TEXT NOT NULL CHECK(state IN ('open','acknowledged','released_external')),
+  assignee TEXT, occurred_at TEXT NOT NULL, reason TEXT,
+  delivery_id INTEGER REFERENCES deliveries(delivery_id),
+  UNIQUE(handoff_id, revision)
+);
+CREATE INDEX IF NOT EXISTS responsibility_subscription ON responsibility_events(subscription_id, responsibility_id);
+CREATE TABLE IF NOT EXISTS receipts (
+  receipt_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+  receiver_id TEXT NOT NULL, receipt_id TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL, raw_sha256 TEXT NOT NULL, source_name TEXT NOT NULL,
+  payload_json TEXT NOT NULL, delivery_key TEXT NOT NULL,
+  delivery_id INTEGER REFERENCES deliveries(delivery_id), responsibility_revision INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','verified','disputed')),
+  reason_code TEXT, reason TEXT, attempts INTEGER NOT NULL DEFAULT 1,
+  conflict INTEGER NOT NULL DEFAULT 0 CHECK(conflict IN (0,1)),
+  received_at TEXT NOT NULL, submitted_at TEXT NOT NULL, verified_at TEXT,
+  UNIQUE(receiver_id, receipt_id)
+);
+CREATE INDEX IF NOT EXISTS receipts_status ON receipts(status, receipt_pk);
+CREATE TABLE IF NOT EXISTS receipt_items (
+  receipt_pk INTEGER NOT NULL REFERENCES receipts(receipt_pk), handoff_id INTEGER NOT NULL,
+  delivery_id INTEGER REFERENCES deliveries(delivery_id), accepted INTEGER NOT NULL CHECK(accepted IN (0,1)),
+  verdict TEXT NOT NULL CHECK(verdict IN ('released','retained','already_released','pending','unmatched')),
+  reason_code TEXT NOT NULL, delivered_revision INTEGER, current_revision INTEGER,
+  record_status_at_delivery TEXT, current_status TEXT,
+  PRIMARY KEY(receipt_pk, handoff_id)
+);
+CREATE INDEX IF NOT EXISTS receipt_items_handoff ON receipt_items(handoff_id, receipt_pk);
+CREATE TABLE IF NOT EXISTS receipt_conflicts (
+  conflict_id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_pk INTEGER NOT NULL REFERENCES receipts(receipt_pk),
+  content_sha256 TEXT NOT NULL, raw_sha256 TEXT NOT NULL, source_name TEXT NOT NULL,
+  payload_json TEXT NOT NULL, observed_at TEXT NOT NULL,
+  UNIQUE(receipt_pk, content_sha256)
+);
+CREATE TABLE IF NOT EXISTS receipt_quarantine (
+  receipt_quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_name TEXT NOT NULL, raw_sha256 TEXT NOT NULL, reason_code TEXT NOT NULL,
+  detail TEXT NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 1, resolved_at TEXT, receipt_pk INTEGER REFERENCES receipts(receipt_pk),
+  UNIQUE(raw_sha256, reason_code)
+);
 """
 
 
@@ -171,7 +244,9 @@ def get_handoff(connection: sqlite3.Connection, handoff_id: int) -> dict[str, An
 
 
 def counts(connection: sqlite3.Connection) -> dict[str, int]:
-    names = ("stations", "subscriptions", "batches", "observations", "handoffs", "quarantine", "activity")
+    names = ("stations", "subscriptions", "batches", "observations", "handoffs", "quarantine", "activity",
+             "receivers", "deliveries", "delivery_items", "responsibility_events", "receipts", "receipt_items",
+             "receipt_conflicts", "receipt_quarantine")
     return {name: int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in names}
 
 

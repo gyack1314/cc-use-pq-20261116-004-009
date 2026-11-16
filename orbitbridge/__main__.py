@@ -7,7 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import audit, catalog, diagnostics, export, handoff, ingest, intake, protocol, quality, reconcile, recovery, store
+from . import (audit, catalog, diagnostics, export, handoff, ingest, intake, protocol, quality, receipts,
+               reconcile, recovery, responsibility, store)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -90,6 +91,63 @@ def parser() -> argparse.ArgumentParser:
     export_check = commands.add_parser("export-check", help="校验导出文件")
     export_check.add_argument("path")
     export_check.add_argument("sha256")
+    receiver = commands.add_parser("receiver-add", help="登记外部接收方")
+    receiver.add_argument("receiver_id")
+    receiver.add_argument("label")
+    receiver_state = commands.add_parser("receiver-state", help="变更外部接收方状态")
+    receiver_state.add_argument("receiver_id")
+    receiver_state.add_argument("state", choices=("active", "inactive"))
+    commands.add_parser("receivers", help="查看外部接收方")
+    delivery = commands.add_parser("export-delivery", help="导出自描述交付版本并登记")
+    delivery.add_argument("subscription_id")
+    delivery.add_argument("destination")
+    delivery.add_argument("--after", type=int, default=0)
+    delivery.add_argument("--through", type=int)
+    delivery.add_argument("--status", choices=("pending", "acknowledged"))
+    delivery.add_argument("--receiver")
+    delivery_register = commands.add_parser("delivery-register", help="完成交付登记")
+    delivery_register.add_argument("delivery_key")
+    delivery_recover = commands.add_parser("delivery-recover", help="文件已写出但登记未完成时恢复核对")
+    delivery_recover.add_argument("path")
+    commands.add_parser("deliveries", help="查看已导出交付版本")
+    delivery_verify = commands.add_parser("delivery-verify", help="重新核对交付版本")
+    delivery_verify.add_argument("delivery_key")
+    delivery_show = commands.add_parser("delivery", help="查看交付版本")
+    delivery_show.add_argument("delivery_key")
+    reassign = commands.add_parser("reassign", help="改派交接责任")
+    reassign.add_argument("handoff_id", type=int)
+    reassign.add_argument("assignee")
+    reassign.add_argument("--reason")
+    responsibilities = commands.add_parser("responsibilities", help="查看当前责任安排")
+    responsibilities.add_argument("--subscription")
+    responsibilities.add_argument("--state", choices=("open", "acknowledged", "released_external"))
+    responsibilities.add_argument("--limit", type=int, default=100)
+    responsibilities.add_argument("--after", type=int, default=0)
+    receipt_submit = commands.add_parser("receipt-submit", help="接收外部离线交接回执")
+    receipt_submit.add_argument("receipt")
+    receipt_dir = commands.add_parser("receipt-dir", help="按目录收件外部回执")
+    receipt_dir.add_argument("directory")
+    receipt_manifest_check = commands.add_parser("receipt-manifest-check", help="预检回执清单")
+    receipt_manifest_check.add_argument("manifest")
+    receipt_manifest_run = commands.add_parser("receipt-manifest-run", help="执行回执清单收件")
+    receipt_manifest_run.add_argument("manifest")
+    receipt_manifest_run.add_argument("--stop-on-error", action="store_true")
+    receipt_recheck = commands.add_parser("receipt-recheck", help="重新核对待核回执")
+    receipt_recheck.add_argument("receipt_pk", type=int, nargs="?")
+    receipt_quarantine = commands.add_parser("receipt-quarantine", help="查看无法解析的回执")
+    receipt_quarantine.add_argument("--after", type=int, default=0)
+    receipt_retry = commands.add_parser("receipt-retry", help="重试隔离的回执")
+    receipt_retry.add_argument("receipt_quarantine_id", type=int)
+    receipt_retry.add_argument("receipt")
+    receipt_list = commands.add_parser("receipts", help="查看回执队列")
+    receipt_list.add_argument("--status", choices=("pending", "verified", "disputed"))
+    receipt_list.add_argument("--receiver")
+    receipt_list.add_argument("--limit", type=int, default=100)
+    receipt_list.add_argument("--after", type=int, default=0)
+    receipt_show = commands.add_parser("receipt", help="查看回执核对理由")
+    receipt_show.add_argument("receipt_pk", type=int)
+    receipt_trace = commands.add_parser("receipt-trace", help="追溯回执的判定与活动")
+    receipt_trace.add_argument("receipt_pk", type=int)
     demo = commands.add_parser("demo", help="运行本地合成数据演示")
     demo.add_argument("--workspace", default="./demo-workspace")
     return root
@@ -127,8 +185,25 @@ def _demo(workspace: Path) -> dict[str, Any]:
         issues = audit.verify_lineage(connection)
         if issues or trace["handoff"]["batch_id"] != accepted.batch_id:
             raise RuntimeError(f"合成演示来源链不一致：{issues}")
+        receipts.register_receiver(connection, "ext-demo", "合成外部接收方", when="2026-10-28T12:05:00Z")
+        delivery = export.export_delivery(connection, "forest-watch", workspace / "handoff-delivery.jsonl",
+                                          receiver_id="ext-demo", when="2026-10-28T12:06:00Z")
+        export.register_delivery(connection, delivery.delivery_key, when="2026-10-28T12:06:01Z")
+        header = json.loads(Path(delivery.descriptor).read_text())
+        payload = {"kind": "handoff-receipt", "schema": 1, "receipt_id": "demo-receipt-1",
+                   "receiver_id": "ext-demo", "delivery_key": delivery.delivery_key,
+                   "received_at": "2026-10-28T12:07:00Z",
+                   "items": [{"handoff_id": item["handoff_id"],
+                              "observation_fingerprint": item["observation_fingerprint"],
+                              "result": "received"} for item in header["items"]]}
+        receipt_file = workspace / "handoff-receipt.json"
+        receipt_file.write_text(json.dumps(payload, ensure_ascii=False))
+        receipt = receipts.submit_receipt(connection, receipt_file, when="2026-10-28T12:08:00Z")
+        trace = audit.handoff_trace(connection, queue[0]["handoff_id"])
         return {"accepted": accepted.as_dict(), "duplicate": duplicate.as_dict(),
-                "handoff": ack, "counts": store.counts(connection), "integrity_issues": issues}
+                "handoff": ack, "delivery": delivery.as_dict(), "receipt": receipt,
+                "states": trace["states"], "counts": store.counts(connection),
+                "integrity_issues": audit.verify_lineage(connection)}
     finally:
         connection.close()
 
@@ -202,6 +277,61 @@ def dispatch(args: argparse.Namespace) -> Any:
                                           start_id=args.after, end_id=args.through, status=args.status).as_dict()
         if args.command == "export-check":
             return export.verify_export(args.path, args.sha256)
+        if args.command == "receiver-add":
+            return receipts.register_receiver(connection, args.receiver_id, args.label)
+        if args.command == "receiver-state":
+            return receipts.set_receiver_active(connection, args.receiver_id, args.state == "active")
+        if args.command == "receivers":
+            return receipts.list_receivers(connection)
+        if args.command == "export-delivery":
+            return export.export_delivery(connection, args.subscription_id, args.destination,
+                                          start_id=args.after, end_id=args.through, status=args.status,
+                                          receiver_id=args.receiver).as_dict()
+        if args.command == "delivery-register":
+            return export.register_delivery(connection, args.delivery_key)
+        if args.command == "delivery-recover":
+            return export.recover_delivery(connection, args.path)
+        if args.command == "deliveries":
+            return export.list_deliveries(connection)
+        if args.command == "delivery-verify":
+            return export.verify_delivery(connection, args.delivery_key)
+        if args.command == "delivery":
+            item = export.find_delivery(connection, args.delivery_key)
+            if item is None:
+                raise export.ExportError("delivery_missing", "交付版本不存在")
+            return {"delivery": {key: value for key, value in item.items() if key != "body_text"},
+                    "items": export.delivery_items(connection, item["delivery_id"])}
+        if args.command == "delivery-recover":
+            return export.recover_delivery(connection, args.path)
+        if args.command == "reassign":
+            return responsibility.reassign(connection, args.handoff_id, args.assignee, reason=args.reason)
+        if args.command == "responsibilities":
+            return responsibility.list_current(connection, subscription_id=args.subscription,
+                                               state=args.state, limit=args.limit, after_id=args.after)
+        if args.command == "receipt-submit":
+            return receipts.submit_receipt(connection, args.receipt)
+        if args.command == "receipt-dir":
+            return receipts.ingest_receipt_directory(connection, args.directory)
+        if args.command == "receipt-manifest-check":
+            return receipts.preflight_receipts(connection, args.manifest)
+        if args.command == "receipt-manifest-run":
+            return receipts.execute_receipt_manifest(connection, args.manifest,
+                                                     stop_on_error=args.stop_on_error)
+        if args.command == "receipt-recheck":
+            if args.receipt_pk is None:
+                return receipts.recheck_pending(connection)
+            return receipts.recheck_receipt(connection, args.receipt_pk)
+        if args.command == "receipt-quarantine":
+            return receipts.list_receipt_quarantine(connection, after_id=args.after)
+        if args.command == "receipt-retry":
+            return receipts.retry_receipt(connection, args.receipt_quarantine_id, args.receipt)
+        if args.command == "receipts":
+            return receipts.list_receipts(connection, status=args.status, receiver_id=args.receiver,
+                                          limit=args.limit, after_id=args.after)
+        if args.command == "receipt":
+            return receipts.receipt_detail(connection, args.receipt_pk)
+        if args.command == "receipt-trace":
+            return audit.receipt_trace(connection, args.receipt_pk)
         raise RuntimeError("未知命令")
     finally:
         connection.close()
@@ -216,7 +346,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return 0
     except (catalog.CatalogError, handoff.HandoffError, ingest.IngestError, audit.AuditError, recovery.RecoveryError,
-            intake.ManifestError, export.ExportError, reconcile.ReconcileError) as exc:
+            intake.ManifestError, export.ExportError, reconcile.ReconcileError, receipts.ReceiptError,
+            responsibility.ResponsibilityError) as exc:
         print(json.dumps({"error": getattr(exc, "code", "error"), "message": str(exc),
                           "quarantine_id": getattr(exc, "quarantine_id", None)}, ensure_ascii=False), file=sys.stderr)
         return 2

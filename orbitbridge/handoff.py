@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from . import catalog, store
+from . import catalog, responsibility, store
 from .normalize import Observation
 
 
@@ -22,6 +22,7 @@ def route_observation(connection: sqlite3.Connection, observation_id: int, obser
             (observation_id, subscription["subscription_id"], when),
         )
         handoff_id = int(cursor.lastrowid)
+        responsibility.ensure_created(connection, handoff_id, when)
         store.record_activity(connection, "handoff_created", "handoff", str(handoff_id), when,
                               {"observation_id": observation_id, "subscription_id": subscription["subscription_id"]})
     return len(matches)
@@ -47,6 +48,7 @@ def acknowledge(connection: sqlite3.Connection, handoff_id: int, operator: str, 
         ).rowcount
         if changed != 1:
             raise HandoffError("acknowledge_conflict", "确认状态冲突")
+        responsibility.local_acknowledge(connection, handoff_id, operator.strip(), timestamp)
         store.record_activity(connection, "handoff_acknowledged", "handoff", str(handoff_id), timestamp,
                               {"operator": operator.strip()})
     return {"status": "acknowledged", **store.get_handoff(connection, handoff_id)}

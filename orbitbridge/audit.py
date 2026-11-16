@@ -5,7 +5,7 @@ import json
 import sqlite3
 from typing import Any
 
-from . import catalog, handoff, store
+from . import catalog, handoff, receipts, responsibility, store
 
 
 class AuditError(ValueError):
@@ -125,7 +125,32 @@ def handoff_trace(connection: sqlite3.Connection, handoff_id: int) -> dict[str, 
     if detail is None:
         raise AuditError("handoff_missing", "交接项不存在")
     history = list_activity(connection, entity_type="handoff", entity_id=str(handoff_id), limit=1000)
-    return {"handoff": detail, "activity": history}
+    timeline = responsibility.history(connection, handoff_id, catalog.utc_now())
+    receipt_rows = receipts.receipt_history(connection, handoff_id)
+    return {"handoff": detail, "activity": history, "responsibility": timeline,
+            "receipts": receipt_rows,
+            "states": {"local_handoff": detail["status"],
+                       "external_receipt": any(row["receipt_status"] == "verified" and row["accepted"]
+                                               for row in receipt_rows),
+                       "pending_receipts": any(row["receipt_status"] == "pending"
+                                               for row in receipt_rows),
+                       "disputed_receipts": any(row["receipt_status"] == "disputed"
+                                                for row in receipt_rows),
+                       "responsibility": timeline[-1]["state"] if timeline else None}}
+
+
+def receipt_trace(connection: sqlite3.Connection, receipt_pk: int) -> dict[str, Any]:
+    """值守人员追查单条回执：待核/已核/争议的理由与逐项判定。"""
+    detail = receipts.receipt_detail(connection, receipt_pk)
+    history = list_activity(connection, entity_type="receipt", entity_id=str(receipt_pk), limit=1000)
+    delivery = None
+    if detail["receipt"]["delivery_id"] is not None:
+        delivery = store.one(connection, "SELECT delivery_id,delivery_key,subscription_id,file_name,status,"
+                             "rows,body_sha256,descriptor_sha256,receiver_id,first_handoff_id,last_handoff_id,"
+                             "created_at,registered_at FROM deliveries WHERE delivery_id=?",
+                             (detail["receipt"]["delivery_id"],))
+    return {"receipt": detail["receipt"], "items": detail["items"], "conflicts": detail["conflicts"],
+            "delivery": delivery, "activity": history}
 
 
 def summary(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -147,4 +172,17 @@ def verify_lineage(connection: sqlite3.Connection) -> list[str]:
                                   "FROM batches b JOIN station_cursors c USING(station_id)"):
         if row["sequence"] > row["committed_sequence"]:
             issues.append(f"uncommitted_batch:{row['batch_id']}")
+    for row in connection.execute("SELECT r.receipt_pk,r.status,COUNT(i.handoff_id) AS items "
+                                  "FROM receipts r LEFT JOIN receipt_items i USING(receipt_pk) "
+                                  "WHERE r.status='verified' GROUP BY r.receipt_pk"):
+        if row["items"] == 0:
+            issues.append(f"receipt_without_items:{row['receipt_pk']}")
+    for row in connection.execute("SELECT i.receipt_pk,i.handoff_id,i.verdict,i.reason_code,i.accepted "
+                                  "FROM receipt_items i JOIN receipts r USING(receipt_pk) "
+                                  "WHERE r.status='verified' AND i.verdict='released'"):
+        current = connection.execute(
+            "SELECT state FROM responsibility_events WHERE handoff_id=? ORDER BY revision DESC LIMIT 1",
+            (row["handoff_id"],)).fetchone()
+        if current is None or current["state"] != "released_external":
+            issues.append(f"released_without_responsibility:{row['handoff_id']}")
     return issues
